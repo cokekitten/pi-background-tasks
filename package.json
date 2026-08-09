@@ -1,0 +1,29 @@
+{
+  "name": "pi-background-tasks",
+  "version": "0.1.0",
+  "description": "Pi tools extension providing run_background / monitor / get_background_output / wait_tasks / kill_task for detached shell commands and real-time event streams.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "background-tasks",
+    "shell",
+    "tools",
+    "monitor"
+  ],
+  "files": [
+    "extensions/",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/background-tasks.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
