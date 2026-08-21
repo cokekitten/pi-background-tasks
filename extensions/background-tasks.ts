@@ -173,6 +173,11 @@ let widgetTui: { requestRender: (force?: boolean) => void } | undefined;
 let widgetRegistered = false;
 let widgetFrame = 0;
 let widgetTimer: ReturnType<typeof setInterval> | undefined;
+// RPC 模式（pi-web 等宿主）：factory 形式的 setWidget 会被 pi 忽略（wire 上什么都发不出去），
+// 但宿主的进程回收需要"扩展在托管后台工作"的语义信号。任务数变化时改用 setStatus 广播
+// （setStatus 在 RPC 下是 wire 事件；TUI 模式下完全不调，交互观感零变化）。
+let isRpcMode = false;
+let lastStatusCount = 0;
 // Ids of tasks started before a /reload or restart: no in-memory handle remains,
 // but the on-disk meta still says running and the pid is alive. Reconciled lazily.
 const stragglers = new Set<string>();
@@ -193,6 +198,14 @@ function runningTaskCount(): number {
 function updateWidget() {
 	if (!uiCtx) return;
 	const n = runningTaskCount();
+	// RPC 豁免信号：任务数 0↔非0（及数量变化）时广播；pi-web 按 statusKey="background-tasks"
+	// 豁免进程回收。statusText 为空 = 清除忙态。
+	if (isRpcMode && n !== lastStatusCount) {
+		lastStatusCount = n;
+		try {
+			uiCtx.setStatus(WIDGET_KEY, n > 0 ? `${n} running` : undefined);
+		} catch {}
+	}
 	if (n === 0) {
 		if (widgetTimer) {
 			clearInterval(widgetTimer);
@@ -644,6 +657,8 @@ export default function backgroundTasksExtension(pi: ExtensionAPI) {
 	// (identity changes on /reload; tasks still alive become stragglers)
 	pi.on("session_start", (_event, ctx) => {
 		uiCtx = ctx.hasUI ? ctx.ui : undefined;
+		isRpcMode = ctx.mode === "rpc";
+		lastStatusCount = 0;
 		widgetRegistered = false;
 		widgetTui = undefined;
 		stragglers.clear();
