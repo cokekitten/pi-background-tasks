@@ -199,11 +199,15 @@ function updateWidget() {
 	if (!uiCtx) return;
 	const n = runningTaskCount();
 	// RPC 豁免信号：任务数 0↔非0（及数量变化）时广播；pi-web 按 statusKey="background-tasks"
-	// 豁免进程回收。statusText 为空 = 清除忙态。
+	// 豁免进程回收。statusText 为空 = 清除忙态。文案与 TUI widget 保持一致（"✻ Waiting for
+	// N background tasks to finish"），web 端条带原样显示。
 	if (isRpcMode && n !== lastStatusCount) {
 		lastStatusCount = n;
 		try {
-			uiCtx.setStatus(WIDGET_KEY, n > 0 ? `${n} running` : undefined);
+			uiCtx.setStatus(
+				WIDGET_KEY,
+				n > 0 ? `Waiting for ${n} background task${n === 1 ? "" : "s"} to finish` : undefined,
+			);
 		} catch {}
 	}
 	if (n === 0) {
