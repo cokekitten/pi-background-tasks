@@ -179,9 +179,22 @@ seed({
 	sessionId: OTHER_SESSION, startedAt: "2026-09-25T02:00:00.000Z", status: "running",
 	exitCode: null, signal: null, finishedAt: null,
 });
+// A monitor that died unobserved: reconcile cannot know the exit code, so it must
+// record the same neutral outcome its live exit path would have (stopped: exited).
+const deadMonPid = liveDetachedPid("sleep 0.05");
+seed({
+	id: "mon_dead", type: "monitor", command: "tail -f /dev/null", cwd: "/tmp", pid: deadMonPid,
+	description: "watch", sessionId: OTHER_SESSION, startedAt: "2026-09-25T02:10:00.000Z",
+	status: "running", exitCode: null, signal: null, finishedAt: null, lineCount: 3,
+});
 await new Promise((r) => setTimeout(r, 200));
 await tools.get("list_tasks")!.execute("t", { status: "all" }, undefined, undefined, makeCtx(MY_SESSION));
-check("dead pid flipped to completed", read("bg_dead").status === "completed");
+check("dead command pid flipped to completed", read("bg_dead").status === "completed");
+check("command task keeps no monitor stoppedReason", read("bg_dead").stoppedReason === undefined);
+check("dead monitor flipped to completed", read("mon_dead").status === "completed");
+check("dead monitor records stoppedReason=exited", read("mon_dead").stoppedReason === "exited", JSON.stringify(read("mon_dead")));
+const peek = await tools.get("get_background_output")!.execute("t", { id: "mon_dead" }, undefined, undefined, makeCtx(MY_SESSION));
+check("get_background_output surfaces stopped: exited", /stopped: exited/.test(peek.content[0].text), peek.content[0].text.slice(0, 220));
 
 for (const pid of cleanup) {
 	try { process.kill(-pid, "SIGKILL"); } catch {}

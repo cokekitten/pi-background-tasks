@@ -136,7 +136,12 @@ function reconcile(id: string): TaskMeta | null {
 	const meta = readMeta(id);
 	if (!meta) return null;
 	if (meta.status === "running" && !isAlive(meta.pid)) {
-		meta.status = meta.type === "monitor" ? "completed" : "completed";
+		// The process ended while nobody was watching (its owner pi died, or it was
+		// released). The exit code is unrecoverable, so the status is the neutral
+		// "completed"; a monitor also gets the reason its live exit path would have
+		// recorded, so get_background_output reads the same either way.
+		meta.status = "completed";
+		if (meta.type === "monitor" && !meta.stoppedReason) meta.stoppedReason = "exited";
 		meta.finishedAt = new Date().toISOString();
 		writeMeta(meta);
 	}

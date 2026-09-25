@@ -28,7 +28,7 @@ Ownership key is **`sessionId`**; `ownerPid` is only a "who is watching this rig
 
 - **Wake mechanism**: all "auto-tell" behaviour is just child-process events (exit / stdout line) observed by pi's own event loop, calling `pi.sendMessage({ triggerTurn: true })`.
 - **Session-resident watchers, detached workers**: the in-memory handles, listeners and timers die with pi or `/reload`; the child processes themselves are detached and keep running (see [Ownership and lifetimes](#ownership-and-lifetimes)). No external daemon.
-- **State**: per-task metadata + logs under `~/.pi/background-tasks/<id>.{json,log}`. Dead pids are lazily reconciled to `completed` by whoever reads them next.
+- **State**: per-task metadata + logs under `~/.pi/background-tasks/<id>.{json,log}`. Dead pids are lazily reconciled to `completed` by whoever reads them next (the exit code is unrecoverable; a monitor also records `stopped: exited`).
 
 ## Install
 
