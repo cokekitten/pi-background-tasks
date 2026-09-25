@@ -54,8 +54,9 @@ interface TaskMeta {
 	command: string;
 	cwd: string;
 	pid: number;
-	ownerPid?: number; // pi process that spawned the task; orphans (dead owner) are adopted and re-homed on restart
-	sessionId?: string; // pi session that spawned the task; lets a resumed session reclaim its own tasks after a crash
+	ownerPid?: number; // pi process currently watching it; a liveness hint only — never an ownership proof
+	sessionId?: string; // authoritative ownership key: only this session may watch/claim the task
+	released?: boolean; // explicitly released: process keeps running, no session watches it
 	description?: string;
 	persistent?: boolean;
 	maxEvents?: number;
@@ -99,6 +100,20 @@ function writeMeta(meta: TaskMeta) {
 	try {
 		writeFileSync(metaPath(meta.id), JSON.stringify(meta, null, 2));
 	} catch {}
+}
+// Every on-disk meta, newest first. Used by list_tasks and the session_start
+// ownership scan (reconcile() then lazily flips dead pids to completed).
+function listMetas(): TaskMeta[] {
+	const out: TaskMeta[] = [];
+	try {
+		for (const f of readdirSync(TASKS_DIR)) {
+			if (!f.endsWith(".json")) continue;
+			const m = readMeta(f.slice(0, -".json".length));
+			if (m) out.push(m);
+		}
+	} catch {}
+	out.sort((a, b) => ((a.startedAt || "") < (b.startedAt || "") ? 1 : -1));
+	return out;
 }
 function isAlive(pid: number): boolean {
 	if (!pid || pid <= 0) return false;
@@ -186,7 +201,10 @@ const stragglers = new Set<string>();
 let piRef: ExtensionAPI | undefined;
 
 function runningTaskCount(): number {
-	let n = tasks.size;
+	let n = 0;
+	for (const h of tasks.values()) {
+		if (!h.meta.released) n++; // released tasks run on but are not "ours to wait for"
+	}
 	for (const id of stragglers) {
 		const m = reconcile(id); // flips dead pids to completed on disk
 		if (m && m.status === "running") n++;
@@ -353,10 +371,19 @@ export default function backgroundTasksExtension(pi: ExtensionAPI) {
 
 			child.on("exit", (code, signal) => {
 				const h = tasks.get(id);
-				if (h) finalize(h, code === 0 ? "completed" : "failed", code, signal ?? null);
+				// Record the outcome either way, but a released task must not notify:
+				// whoever released it explicitly opted out of being woken.
+				if (h && !h.meta.released) finalize(h, code === 0 ? "completed" : "failed", code, signal ?? null);
+				else if (h) {
+					h.meta.status = code === 0 ? "completed" : "failed";
+					h.meta.exitCode = code;
+					h.meta.signal = signal ?? null;
+					h.meta.finishedAt = new Date().toISOString();
+					writeMeta(h.meta);
+				}
 				tasks.delete(id);
 				updateWidget();
-				if (doNotify) {
+				if (doNotify && !meta.released) {
 					notify(
 						pi,
 						`Background task ${id} finished — status: ${meta.status === "running" ? (code === 0 ? "completed" : "failed") : meta.status}, exit: ${code ?? signal}.`,
@@ -609,18 +636,98 @@ export default function backgroundTasksExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	// --- tool: list_tasks ---------------------------------------------------
+	pi.registerTool({
+		name: "list_tasks",
+		label: "List Background Tasks",
+		description:
+			"Enumerate background tasks on disk (run_background + monitor) with status, pid, command and ownership. " +
+			"Answers 'what is hanging in the background right now' across sessions. Tasks owned by another session are listed but marked " +
+			"other-session: they are not counted by this session's waiting widget and should not be killed from here.",
+		promptSnippet: "List background tasks and who owns each (across sessions)",
+		parameters: Type.Object({
+			status: Type.Optional(
+				Type.Union([Type.Literal("running"), Type.Literal("all")], {
+					description: "'running' (default) = only tasks still running; 'all' = include finished ones",
+				}),
+			),
+			limit: Type.Optional(Type.Number({ description: "Max rows to return (default 30, newest first)" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const onlyRunning = params.status !== "all";
+			const limit = Math.max(1, Math.min(params.limit ?? 30, 200));
+			const mySessionId = safeSessionId(ctx);
+			const rows: string[] = [];
+			let running = 0;
+			let mine = 0;
+			let scanned = 0;
+			for (const raw of listMetas()) {
+				const m = reconcile(raw.id) ?? raw; // flips dead pids to completed on disk
+				scanned++;
+				const ownedByMe = (mySessionId !== undefined && m.sessionId === mySessionId) || m.ownerPid === process.pid;
+				if (m.status === "running") running++;
+				if (ownedByMe && m.status === "running" && !m.released) mine++;
+				if (onlyRunning && m.status !== "running") continue;
+				if (rows.length >= limit) continue;
+				const own = m.released ? "released" : ownedByMe ? "mine" : m.sessionId ? "other-session" : "unowned";
+				const cmd = (m.description ? `[${m.description}] ` : "") + (m.command || "");
+				rows.push(
+					`  ${m.startedAt.slice(0, 19).replace("T", " ")}  ${m.status.padEnd(9)} ${own.padEnd(13)} ${m.id}  pid ${m.pid}  ${cmd.slice(0, 72)}`,
+				);
+			}
+			const header = `Background tasks: ${running} running (${mine} watched by this session), ${scanned} total on disk.`;
+			return {
+				content: [{ type: "text", text: rows.length ? `${header}\n\n${rows.join("\n")}` : header }],
+				details: { running, mine, scanned, shown: rows.length },
+			};
+		},
+	});
+
 	// --- tool: kill_task ----------------------------------------------------
 	pi.registerTool({
 		name: "kill_task",
 		label: "Kill a Background Task",
 		description:
-			"Terminate a running background task or monitor. Sends SIGTERM then SIGKILL to the whole process group. Reports success if the task was killed or had already exited.",
+			"Terminate a running background task or monitor. Sends SIGTERM then SIGKILL to the whole process group. Reports success if the task was killed or had already exited. " +
+			"Pass mode=\"release\" to stop watching a run_background task without killing it (the process keeps running and the waiting indicator clears).",
 		promptSnippet: "Kill a running background task or monitor",
 		parameters: Type.Object({
 			id: Type.String({ description: "Task id to kill" }),
+			mode: Type.Optional(
+				Type.Union([Type.Literal("kill"), Type.Literal("release")], {
+					description:
+						"'kill' (default) terminates the process group. 'release' un-watches the task without touching the process: it keeps running, this session stops counting it, and get_background_output still reads its log. Only valid for run_background tasks — monitors stream output through this process and must be killed.",
+				}),
+			),
 		}),
 		async execute(_toolCallId, params) {
 			const id = params.id;
+			if (params.mode === "release") {
+				if (stopFns.has(id)) {
+					return {
+						content: [{ type: "text", text: `Monitor ${id} streams its output through this process — releasing it would backpressure the pipe. Use mode "kill", or rely on maxEvents auto-stop.` }],
+						isError: true,
+					};
+				}
+				const target = tasks.get(id)?.meta ?? reconcile(id);
+				if (!target) return { content: [{ type: "text", text: `No such task: ${id}` }], isError: true };
+				if (target.status !== "running") {
+					return {
+						content: [{ type: "text", text: `Task ${id} already ${target.status}; nothing to release.` }],
+						details: { taskId: id, released: false, status: target.status },
+					};
+				}
+				target.released = true;
+				target.ownerPid = 0; // unowned from now on: no session adopts it after a restart
+				writeMeta(target);
+				stragglers.delete(id); // drop it now instead of waiting for the next reconcile tick
+				try { tasks.get(id)?.child.unref(); } catch {}
+				updateWidget();
+				return {
+					content: [{ type: "text", text: `Released task ${id} — pid ${target.pid} keeps running, unwatched.\nlog: ${logPath(id)}\nUse get_background_output with this id to peek; kill_task (mode kill) to stop it.` }],
+					details: { taskId: id, released: true, pid: target.pid },
+				};
+			}
 			// monitor-specific stop (notifies reason=killed) if applicable
 			const stop = stopFns.get(id);
 			if (stop) {
@@ -669,31 +776,29 @@ export default function backgroundTasksExtension(pi: ExtensionAPI) {
 		if (uiCtx) {
 			const mySessionId = safeSessionId(ctx);
 			try {
-				for (const f of readdirSync(TASKS_DIR)) {
-					if (!f.endsWith(".json")) continue;
-					const m = reconcile(f.slice(0, -".json".length));
-					if (!m || m.status !== "running") continue;
+				for (const m of listMetas()) {
+					if (m.status !== "running") continue;
 					// already have a live handle in this process (e.g. session switch
 					// within the same pi): not a straggler — avoid double-count/notify
 					if (tasks.has(m.id)) continue;
+					// Deliberately released (kill_task mode=release): keep running, unwatched.
+					if (m.released) continue;
 					if (m.ownerPid === process.pid) {
 						// Same process (e.g. after /reload): still ours.
 						stragglers.add(m.id);
 					} else if (mySessionId && m.sessionId === mySessionId) {
 						// Our own session's task, resumed after crash/restart. Claim it
-						// back even if another session adopted it in the meantime.
-						m.ownerPid = process.pid;
-						writeMeta(m);
-						stragglers.add(m.id);
-					} else if (m.ownerPid === undefined || !isAlive(m.ownerPid)) {
-						// Orphan: the owning pi process is gone (crash/restart) or
-						// this is a legacy meta without ownerPid. Adopt it and
-						// re-home on disk so other live sessions don't double-adopt.
+						// back even if another process still looks like the owner.
 						m.ownerPid = process.pid;
 						writeMeta(m);
 						stragglers.add(m.id);
 					}
-					// else: owned by another live pi session — leave it alone.
+					// Anything else belongs to ANOTHER session. Its child is detached
+					// (unref'd, reparented to launchd) so it keeps running, but we must not
+					// adopt it: that makes this session announce "Waiting for N background
+					// tasks" for work it never started, and ownership-by-PID-liveness also
+					// breaks under PID reuse. Ownership travels only back to the session
+					// that spawned the task (branch above).
 				}
 			} catch {}
 		}
