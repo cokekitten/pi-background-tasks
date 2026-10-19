@@ -1,7 +1,7 @@
 {
   "name": "pi-background-tasks",
   "version": "0.1.1",
-  "description": "Pi tools extension providing run_background / monitor / list_tasks / get_background_output / wait_tasks / kill_task for detached shell commands and real-time event streams.",
+  "description": "Pi tools extension providing run_background / monitor / wait_until / wait_tasks / get_background_output / list_tasks / kill_task — detached shell commands, real-time event streams, condition-based waiting, and a foreground-sleep guard.",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -19,7 +19,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types test/ownership.test.ts"
+    "test": "node --experimental-strip-types test/ownership.test.ts && node --experimental-strip-types test/lifecycle.test.ts"
   },
   "pi": {
     "extensions": [

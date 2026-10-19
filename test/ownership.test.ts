@@ -123,7 +123,13 @@ seed({
 // --- T1: session_start must not adopt foreign tasks ----------------------
 console.log("\nT1 ownership");
 handlers.get("session_start")!({}, makeCtx(MY_SESSION));
-check("foreign task untouched on disk", readFileSync(join(DIR, "bg_foreign.json"), "utf8") === foreignBefore);
+check("foreign task ownership untouched on disk", (() => {
+	// Byte equality is too strict now: the orphan sweep (session_start) may stamp
+	// `orphanedAt` on a task whose owning pi is dead — that is the intended reaping
+	// path, not adoption. What must never change is who owns it.
+	const now = read("bg_foreign");
+	return now.ownerPid === DEAD_PID && now.sessionId === OTHER_SESSION && !now.released && !now.persistent;
+})(), JSON.stringify(read("bg_foreign")));
 check("legacy (no sessionId) task untouched", !read("bg_legacy").released && read("bg_legacy").ownerPid === undefined);
 check("own task reclaimed after restart", read("bg_mine").ownerPid === process.pid);
 check("widget counts only our own task", widgetText().includes("Waiting for 1 background task to finish"), widgetText());
