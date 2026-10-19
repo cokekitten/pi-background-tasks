@@ -38,7 +38,7 @@
 
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import {
 	appendFileSync,
 	closeSync,
@@ -180,6 +180,21 @@ function listMetas(): TaskMeta[] {
 	out.sort((a, b) => ((a.startedAt || "") < (b.startedAt || "") ? 1 : -1));
 	return out;
 }
+/**
+ * Wall-clock start time of a process, or null when it cannot be determined.
+ * Used only to tell "the pi that spawned this task is still alive" from "its pid
+ * was recycled by an unrelated process", which `isAlive()` alone cannot do.
+ */
+function processStartTime(pid: number): number | null {
+	try {
+		const r = spawnSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
+		if (r.status !== 0 || !r.stdout) return null;
+		const t = Date.parse(r.stdout.trim());
+		return Number.isFinite(t) ? t : null;
+	} catch {
+		return null;
+	}
+}
 function isAlive(pid: number): boolean {
 	if (!pid || pid <= 0) return false;
 	try {
@@ -204,6 +219,7 @@ function reconcile(id: string): TaskMeta | null {
 		// The watchdog reaped it: its owning pi was gone and the grace expired.
 		meta.status = "killed";
 		meta.stoppedReason = "deadman";
+		meta.watcherPid = undefined;
 		meta.signal = meta.signal ?? "SIGTERM";
 		meta.finishedAt = meta.finishedAt ?? new Date().toISOString();
 		writeMeta(meta);
@@ -215,6 +231,7 @@ function reconcile(id: string): TaskMeta | null {
 		// "completed"; a monitor also gets the reason its live exit path would have
 		// recorded, so get_background_output reads the same either way.
 		meta.status = "completed";
+		meta.watcherPid = undefined;
 		if (meta.type === "monitor" && !meta.stoppedReason) meta.stoppedReason = "exited";
 		meta.finishedAt = new Date().toISOString();
 		writeMeta(meta);
@@ -234,7 +251,15 @@ function sweepOrphans(): number {
 		if (meta.status !== "running" || meta.persistent || meta.released) continue;
 		if (meta.ownerPid === process.pid) continue;
 		if (!isAlive(meta.pid ?? 0)) continue; // reconcile() flips these to completed
-		if (meta.ownerPid && isAlive(meta.ownerPid)) continue; // its pi is still running
+		if (meta.ownerPid && meta.ownerPid !== process.pid && isAlive(meta.ownerPid)) {
+			// A live pid proves nothing on its own: pids are recycled. If the process
+			// now holding that pid started AFTER the task, it cannot be the one that
+			// spawned it — the real owner is gone and this is an orphan.
+			const ownerStarted = processStartTime(meta.ownerPid);
+			const taskStarted = Date.parse(meta.startedAt ?? "");
+			const recycled = ownerStarted !== null && Number.isFinite(taskStarted) && ownerStarted > taskStarted + 2000;
+			if (!recycled) continue; // its pi really is still running
+		}
 		if (!meta.orphanedAt) {
 			meta.orphanedAt = new Date().toISOString();
 			writeMeta(meta);
@@ -289,6 +314,7 @@ function finalize(handle: Handle, status: TaskStatus, exitCode: number | null, s
 	handle.meta.exitCode = exitCode;
 	handle.meta.signal = signal;
 	handle.meta.finishedAt = new Date().toISOString();
+	handle.meta.watcherPid = undefined; // killed above, or exiting on its own now
 	writeMeta(handle.meta);
 }
 

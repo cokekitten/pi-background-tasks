@@ -29,6 +29,7 @@ const ext = (await import("../extensions/background-tasks.ts")).default;
 const { spawnWatcher } = await import("../extensions/background-tasks.ts");
 
 const MY_SESSION = "33333333-3333-4333-8333-333333333333";
+const OTHER_SESSION = "44444444-4444-4444-8444-444444444444";
 
 type Tool = { name: string; parameters: unknown; execute: (...a: any[]) => Promise<any> };
 const tools = new Map<string, Tool>();
@@ -150,11 +151,14 @@ console.log("\nT3 guard wiring through tool_call/tool_result");
 	check("block reason carries a task id", /bg_[a-z0-9_]+/.test(third?.reason ?? ""), third?.reason ?? "");
 	check("block reason explains the opt-out", /PI_FG_SLEEP=1/.test(third?.reason ?? ""));
 	const promotedId = /bg_[a-z0-9_]+/.exec(third?.reason ?? "")?.[0] ?? "";
-	await sleepMs(2600);
-	check("promoted command actually ran", existsSync(marker), marker);
+	// read the meta while the promoted command is still running: finalize() clears
+	// watcherPid once the task exits (the watchdog is history from then on)
 	const promotedMeta = read(promotedId);
 	check("promoted task is labelled", promotedMeta.description === "auto-promoted foreground sleep", JSON.stringify(promotedMeta));
-	check("promoted task got a deadman watchdog", typeof promotedMeta.watcherPid === "number");
+	check("promoted task got a deadman watchdog", typeof promotedMeta.watcherPid === "number", JSON.stringify(promotedMeta));
+	await sleepMs(2600);
+	check("promoted command actually ran", existsSync(marker), marker);
+	check("finished task no longer advertises a watchdog", read(promotedId).watcherPid === undefined);
 
 	// nested calls (codemode scripts) never get promoted
 	const nested = await toolCall(bashEvent("sleep 90; ls", "c7", { parentToolCallId: "c1/1" }), ctx);
@@ -276,6 +280,57 @@ console.log("\nT6 deadman watchdog really kills once its pi is gone");
 	check("config.json is not listed as a task", !/config\.json/.test(listed.content[0].text), listed.content[0].text.slice(0, 200));
 	const deadmanMeta = read(deadmanId);
 	check("reaped task reports status killed + stoppedReason deadman", deadmanMeta.status === "killed" && deadmanMeta.stoppedReason === "deadman", JSON.stringify(deadmanMeta));
+}
+
+console.log("\nT7 orphan sweep survives pid reuse");
+{
+	// A live pid proves nothing: pids are recycled. `bg_reused` records an owner pid
+	// that now belongs to a *newer* process than the task itself, so the real owner
+	// is gone. `bg_liveowner` records a pid that started before the task — a real
+	// live owner — and must be left alone.
+	const fresh = spawn("sleep 60", { shell: true, detached: true, stdio: "ignore" });
+	fresh.unref();
+	cleanup.push(fresh.pid!);
+	const longLived = spawn("sleep 60", { shell: true, detached: true, stdio: "ignore" });
+	longLived.unref();
+	cleanup.push(longLived.pid!);
+	await sleepMs(1500); // let the "old" owner get a start time in the past
+
+	const victim = spawn("sleep 60", { shell: true, detached: true, stdio: "ignore" });
+	victim.unref();
+	cleanup.push(victim.pid!);
+	writeFileSync(
+		join(DIR, "bg_reused.json"),
+		JSON.stringify({
+			id: "bg_reused", type: "command", command: "sleep 60", cwd: HOME, pid: victim.pid,
+			ownerPid: fresh.pid, // recycled: this process started AFTER the task
+			sessionId: OTHER_SESSION, startedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+			status: "running", exitCode: null, signal: null, finishedAt: null,
+		}),
+	);
+	const kept = spawn("sleep 60", { shell: true, detached: true, stdio: "ignore" });
+	kept.unref();
+	cleanup.push(kept.pid!);
+	writeFileSync(
+		join(DIR, "bg_liveowner.json"),
+		JSON.stringify({
+			id: "bg_liveowner", type: "command", command: "sleep 60", cwd: HOME, pid: kept.pid,
+			ownerPid: longLived.pid, // real live owner: started before the task
+			sessionId: OTHER_SESSION, startedAt: new Date().toISOString(),
+			status: "running", exitCode: null, signal: null, finishedAt: null,
+		}),
+	);
+
+	writeFileSync(join(DIR, "config.json"), JSON.stringify({ sleepGuard: { minSeconds: 1 }, orphanGraceMs: 0 }));
+	handlers.get("session_start")!({}, ctx);
+	check("recycled-owner task is stamped as orphaned", typeof read("bg_reused").orphanedAt === "string", JSON.stringify(read("bg_reused")));
+	check("live-owner task is left alone", read("bg_liveowner").orphanedAt === undefined);
+	handlers.get("session_start")!({}, ctx); // grace 0 → second pass reaps it
+	await sleepMs(300);
+	const reaped = read("bg_reused");
+	check("orphan reaped after grace", reaped.status === "killed" && reaped.stoppedReason === "orphan-grace", JSON.stringify(reaped));
+	check("orphan process is gone", !isAlive(victim.pid!), `pid ${victim.pid} alive`);
+	check("live-owner task still running", read("bg_liveowner").status === "running" && isAlive(kept.pid!));
 }
 
 for (const pid of cleanup) {
